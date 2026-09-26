@@ -35,6 +35,9 @@ DRY_RUN=0
 LIST_ONLY=0
 DIRECT_URL=""
 IM4M_OVERRIDE=""
+PRODUCT_OVERRIDE=""
+MODEL_OVERRIDE=""
+CPID_OVERRIDE=""
 KERNEL_MODE="patched"
 KPF_SET="auto"
 KERNEL_MODE_SET=0
@@ -45,11 +48,13 @@ usage() {
     cat <<'EOF'
 usage: ./build.sh [--version VERSION|--build BUILD|--url IPSW_URL]
                   [--list] [--im4m PATH]
+                  [--product PRODUCT --board BOARD --cpid CPID]
                   [--kernel stock|patched] [--kpf-set SET]
                   [--with-fw|--no-fw] [--use-ibss] [--live-data] [--dry-run]
 
-Detects the connected pwned DFU A12/A13 device, resolves firmware from
-ipsw.me (or --url), builds an SSH ramdisk, and stages a bootchain under
+Detects a connected pwned-DFU device, or accepts an explicit product/board/CPID
+for a build without attached hardware. Resolves firmware from ipsw.me (or --url),
+builds an SSH ramdisk, and stages a bootchain under
 ./bootchain/<board>-<ver>-<build>-ramdisk/.
 
 Pwned DFU requires RP2350 + https://github.com/prdgmshift/usbliter8
@@ -59,6 +64,9 @@ If neither --version nor --build is given, an interactive firmware picker runs.
 
   --list         list firmwares for the connected device and exit
   --im4m PATH    IM4M / APTicket (default: resources/IM4M_<CPID>)
+  --product      IPSW product identifier (e.g. iPhone11,8)
+  --board        BuildManifest device class (e.g. n841ap)
+  --cpid         chip ID (0x8020 for A12, 0x8030 for A13)
   --kernel       patched (default, usbliter8ra1n AMFI) | stock (fallback)
   --kpf-set      auto (default) | ios17|ios18|ios26|ios27|debugger+amfi|all
   --with-fw      stage AOP/ANE/AVE/ISP/GFX/SIO (+ PMP on A13) — default ON
@@ -68,6 +76,7 @@ If neither --version nor --build is given, an interactive firmware picker runs.
   --dry-run      resolve IPSW + BuildManifest only
 
 Requires: device in DFU with PWND: usbliter8; deps from ./setup.sh.
+When building on CI without hardware, pass --product, --board, and --cpid.
 EOF
 }
 
@@ -86,6 +95,21 @@ while (($#)); do
         --im4m)
             (($# >= 2)) || { usage >&2; exit 64; }
             IM4M_OVERRIDE="$2"
+            shift 2
+            ;;
+        --product)
+            (($# >= 2)) || { usage >&2; exit 64; }
+            PRODUCT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --board)
+            (($# >= 2)) || { usage >&2; exit 64; }
+            MODEL_OVERRIDE="$2"
+            shift 2
+            ;;
+        --cpid)
+            (($# >= 2)) || { usage >&2; exit 64; }
+            CPID_OVERRIDE="$2"
             shift 2
             ;;
         --kernel)
@@ -129,23 +153,40 @@ for tool in "$IRECOVERY" "$PZB" "$IMG4" "$GTAR" "$TC" "$JQ" curl ipsw python3 hd
     fi
 done
 
-DEVICE_INFO="$("$IRECOVERY" -q)"
+MANUAL_DEVICE=0
+if [[ -n "$PRODUCT_OVERRIDE$MODEL_OVERRIDE$CPID_OVERRIDE" ]]; then
+    [[ -n "$PRODUCT_OVERRIDE" && -n "$MODEL_OVERRIDE" && -n "$CPID_OVERRIDE" ]] || {
+        echo "--product, --board, and --cpid must be supplied together" >&2
+        exit 64
+    }
+    PRODUCT="$PRODUCT_OVERRIDE"
+    MODEL="$MODEL_OVERRIDE"
+    CPID="$CPID_OVERRIDE"
+    MODE="manual"
+    PWND="not-required"
+    MANUAL_DEVICE=1
+else
+    DEVICE_INFO="$("$IRECOVERY" -q)"
+fi
 field() {
     awk -F': ' -v key="$1" '$1 == key { print $2; exit }' <<<"$DEVICE_INFO"
 }
-PRODUCT="$(field PRODUCT)"
-MODEL="$(field MODEL)"
-CPID="$(field CPID)"
-MODE="$(field MODE)"
-PWND="$(field PWND)"
-ECID="$(field ECID)"
-NAME="$(field NAME)"
+if ((!MANUAL_DEVICE)); then
+    PRODUCT="$(field PRODUCT)"
+    MODEL="$(field MODEL)"
+    CPID="$(field CPID)"
+    MODE="$(field MODE)"
+    PWND="$(field PWND)"
+    ECID="$(field ECID)"
+    NAME="$(field NAME)"
+fi
 
 [[ -n "$PRODUCT" && -n "$MODEL" && -n "$CPID" ]] || {
-    echo "irecovery did not return PRODUCT, MODEL, and CPID" >&2
-    echo "Connect the device in DFU after usbliter8." >&2
+    echo "missing PRODUCT, MODEL, or CPID (or incomplete manual device arguments)" >&2
+    echo "Connect a pwned-DFU device or pass --product, --board, and --cpid." >&2
     exit 1
 }
+if ((!MANUAL_DEVICE)); then
 [[ "$MODE" == "DFU" ]] || {
     echo "builder requires DFU; device reports MODE=$MODE" >&2
     exit 1
@@ -154,6 +195,7 @@ NAME="$(field NAME)"
     echo "device must be pwned with usbliter8 (PWND: usbliter8); got PWND=${PWND:-none}" >&2
     exit 1
 }
+fi
 nr_is_supported_cpid "$CPID" || {
     echo "unsupported CPID $CPID (this toolkit targets A12/A13: 0x8020 / 0x8030)" >&2
     exit 1
@@ -313,6 +355,16 @@ manifest_path() {
 }
 
 MANIFEST_BUILD="$(manifest_path ManifestBuild)"
+echo
+echo "=== parsed BuildManifest ($MODEL) ==="
+echo "  manifest build: ${MANIFEST_BUILD:-unknown}"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::group::BuildManifest component paths"
+fi
+sed '/^ManifestBuild=/d;s/^/  /;s/=/ : /' <<<"$MANIFEST_INFO" | sort
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::endgroup::"
+fi
 if [[ "$VERSION" != "unknown" && -n "$MANIFEST_BUILD" && "$MANIFEST_BUILD" != "$BUILD" ]]; then
     echo "BuildManifest build $MANIFEST_BUILD does not match selected build $BUILD" >&2
     exit 1

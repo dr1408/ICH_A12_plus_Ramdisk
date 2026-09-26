@@ -1,0 +1,103 @@
+name: Build ICH bootchain (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: 'Direct IPSW URL'
+        required: true
+        default: 'https://updates.cdn-apple.com/2026SpringFCS/fullrestores/122-55846/29C16253-0FBA-44A4-91B6-642C9B813BE1/iPhone12%2C1_26.5_23F77_Restore.ipsw'
+        type: string
+      product:
+        description: 'Target product identifier (iPhone 11)'
+        required: true
+        default: iPhone12,1
+        type: string
+      board:
+        description: 'Target BuildManifest board (iPhone 11)'
+        required: true
+        default: n104ap
+        type: string
+      cpid:
+        description: 'Target chip ID (0x8020 A12, 0x8030 A13)'
+        required: true
+        default: '0x8030'
+        type: string
+      kpf_set:
+        description: 'kpf-set (auto|ios18|...)'
+        required: false
+        default: ios26
+      kernel_mode:
+        description: 'Kernel mode (patched or stock)'
+        required: true
+        default: patched
+        type: choice
+        options:
+          - patched
+          - stock
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Make scripts executable
+        run: |
+          chmod +x ./setup.sh ./build.sh ./boot.sh || true
+
+      - name: Setup build dependencies
+        run: |
+          brew tap blacktop/tap
+          brew trust blacktop/tap
+          brew install --formula blacktop/tap/ipsw
+          brew install libpng
+          python3 -m venv .gha-venv
+          source .gha-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt lzfse
+
+      - name: Build native ibootim for logo generation
+        run: |
+          # The checked-in x86_64 ibootim is linked to Intel Homebrew's
+          # /usr/local libpng. Build the pinned source natively for this runner.
+          git clone https://github.com/LukeZGD/ibootim.git "$RUNNER_TEMP/ibootim-src"
+          git -C "$RUNNER_TEMP/ibootim-src" checkout 042d03d
+          LIBPNG_PREFIX="$(brew --prefix libpng)"
+          cc -O2 -I"$LIBPNG_PREFIX/include/libpng16" \
+            "$RUNNER_TEMP/ibootim-src/ibootim.c" \
+            "$RUNNER_TEMP/ibootim-src/lzss.c" \
+            "$RUNNER_TEMP/ibootim-src/main.c" \
+            -L"$LIBPNG_PREFIX/lib" -Wl,-rpath,"$LIBPNG_PREFIX/lib" \
+            -lpng16 -lz -o tools/darwin/ibootim
+          file tools/darwin/ibootim
+
+      - name: Parse IPSW and build bootchain
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          PRODUCT: ${{ inputs.product }}
+          BOARD: ${{ inputs.board }}
+          CPID: ${{ inputs.cpid }}
+          KPF_SET: ${{ inputs.kpf_set }}
+          KERNEL_MODE: ${{ inputs.kernel_mode }}
+          NR_TOOLS: ${{ github.workspace }}/tools/darwin
+        run: |
+          source .gha-venv/bin/activate
+          set -x
+          ./build.sh --url "$IPSW_URL" --product "$PRODUCT" --board "$BOARD" \
+            --cpid "$CPID" --kpf-set "$KPF_SET" --kernel "$KERNEL_MODE" --with-fw
+
+      - name: Upload bootchain artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ich-bootchain
+          path: |
+            bootchain/*
+          if-no-files-found: error
+          retention-days: 7

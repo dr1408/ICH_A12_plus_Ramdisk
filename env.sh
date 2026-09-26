@@ -12,7 +12,10 @@ export NR_RESOURCES="$ROOT/resources"
 export NR_CACHE="$ROOT/cache"
 export NR_WORK="$ROOT/work"
 export NR_BOOTCHAIN_ROOT="$ROOT/bootchain"
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS${PATH:+:$PATH}"
+# Keep an active virtualenv (and caller-provided tools) ahead of system paths.
+# build.sh sources this file after CI activates .gha-venv; putting /usr/bin first
+# silently selects macOS's system Python, which does not have the pip dependencies.
+export PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS"
 # shellcheck source=scripts/banner.sh
 source "$ROOT/scripts/banner.sh"
 
